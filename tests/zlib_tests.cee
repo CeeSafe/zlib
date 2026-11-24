@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: MIT
+// The package's tests. The checksums are Python's (`zlib.crc32`, `zlib.adler32`) of the same bytes, not this
+// package's output: an independent implementation of the same functions.
+
+/// The bytes the round-trip tests use: 100,000 of them, `k * 7 % 251`.
+fn sample() -> Vector<u8> {
+    var data = Vector<u8>.create();
+    for (k in 0..100000u32) {
+        data.push(truncate<u8>(k * 7 % 251))!;
+    }
+    return data;
+}
+
+@test
+fn checksumsAgreeWithPython() -> Result<void, TestFailure> {
+    Check.equalU64(0, Zlib.crc32([]) as u64)?;
+    Check.equalU64(1, Zlib.adler32([]) as u64)?;
+    Check.equalU64(222957957, Zlib.crc32("hello world".bytes()) as u64)?;
+    Check.equalU64(436929629, Zlib.adler32("hello world".bytes()) as u64)?;
+    let fox = "The quick brown fox jumps over the lazy dog".bytes();
+    Check.equalU64(1095738169, Zlib.crc32(fox) as u64)?;
+    Check.equalU64(1541148634, Zlib.adler32(fox) as u64)?;
+    let data = sample();
+    Check.equalU64(2963850189, Zlib.crc32(data.view()) as u64)?;
+    Check.equalU64(1132184622, Zlib.adler32(data.view()) as u64)?;
+    return Ok();
+}
+
+@test
+fn checksumsContinue() -> Result<void, TestFailure> {
+    let first = Zlib.crc32("hello ".bytes());
+    Check.equalU64(222957957, Zlib.crc32Update(first, "world".bytes()) as u64)?;
+    let start = Zlib.adler32("hello ".bytes());
+    Check.equalU64(436929629, Zlib.adler32Update(start, "world".bytes()) as u64)?;
+    return Ok();
+}
+
+@test
+fn roundTrips() -> Result<void, TestFailure> {
+    let data = sample();
+    for (level in -1..10) {
+        let packed = match (Zlib.compressLevel(data.view(), level)) {
+            Ok(p) => p,
+            Err(_) => { return Err(TestFailure.create("compress failed")); }
+        };
+        let back = match (Zlib.uncompress(packed.view(), data.length)) {
+            Ok(b) => b,
+            Err(_) => { return Err(TestFailure.create("uncompress failed")); }
+        };
+        Check.equalU64(data.length as u64, back.length as u64)?;
+        Check.equalU64(2963850189, Zlib.crc32(back.view()) as u64)?;
+        Check.isTrue(level == 0 || packed.length < data.length, "a level above 0 makes the sample smaller")?;
+    }
+    return Ok();
+}
+
+@test
+fn refusesWhatIsWrong() -> Result<void, TestFailure> {
+    let data = sample();
+    let packed = match (Zlib.compress(data.view())) {
+        Ok(p) => p,
+        Err(_) => { return Err(TestFailure.create("compress failed")); }
+    };
+    match (Zlib.uncompress(packed.view(), 10)) {
+        Err(ZlibError.BufferTooSmall) => {}
+        _ => { return Err(TestFailure.create("10 bytes for 100,000 was not BufferTooSmall")); }
+    }
+    let junk = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    match (Zlib.uncompress(junk[..], 100)) {
+        Err(ZlibError.CorruptData) => {}
+        _ => { return Err(TestFailure.create("bytes that are not zlib's format were not CorruptData")); }
+    }
+    match (Zlib.compressLevel(data.view(), 10)) {
+        Err(ZlibError.InvalidLevel) => {}
+        _ => { return Err(TestFailure.create("level 10 was not InvalidLevel")); }
+    }
+    return Ok();
+}
+
+@test
+fn reportsItsVersion() -> Result<void, TestFailure> {
+    Check.isTrue(Zlib.version().startsWith("1."), "zlibVersion() starts with 1.")?;
+    return Ok();
+}

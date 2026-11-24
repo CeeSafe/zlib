@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: MIT
+// zlib's one-shot compression and its checksums, over the binding `ceesafec cbind` writes (src/bind.cee). zlib's
+// sizes and checksums are `uLong`, C's `unsigned long`: `CULong`, 32 bits on Windows and 64 elsewhere. A `usize`
+// goes in through `checkedTruncate`, so a buffer too large for the target's `uLong` is an error, never a wrong size.
+
+/// What zlib, or the memory for its result, refused.
+public enum ZlibError {
+    /// A buffer for the result could not be allocated, or zlib could not allocate its own state.
+    OutOfMemory,
+    /// The compressed data does not uncompress to at most the size given (zlib's `Z_BUF_ERROR`).
+    BufferTooSmall,
+    /// The data is not zlib's format, or is cut short (`Z_DATA_ERROR`).
+    CorruptData,
+    /// A compression level outside -1 to 9 (`Z_STREAM_ERROR`).
+    InvalidLevel,
+    /// A buffer longer than the target's `uLong` can count (4 GiB on Windows).
+    TooLarge,
+    /// Another status zlib returned.
+    Failed,
+}
+
+/// The functions of this package: `Zlib.compress(data)`, `Zlib.uncompress(packed, size)`, `Zlib.crc32(data)`.
+public struct Zlib {
+    /// zlib's version, as the library linked in reports it (`zlibVersion()`), such as `1.3.1`.
+    /// Safety: zlib returns a pointer to a static, NUL-terminated ASCII string, never freed.
+    public fn version() -> StringView {
+        let text = unsafe { CStr.fromPtr(zlibVersion()) };
+        return match (text) {
+            Some(c) => c.view(),
+            null => "?",
+        };
+    }
+
+    /// `data` compressed in zlib's format at the default level (`compress`).
+    public fn compress(data: Slice<u8>) -> Result<Vector<u8>, ZlibError> =>
+        Zlib.compressLevel(data, Z_DEFAULT_COMPRESSION);
+
+    /// `data` compressed at `level`: 0 stores it, 1 is fastest, 9 smallest, -1 the default (`compress2`).
+    /// Safety: zlib reads `data.length` bytes from `data.ptr` and writes at most `length` bytes, the size of `out`, which
+    /// it is told; it sets `length` to what it wrote, which `truncate` keeps.
+    public fn compressLevel(data: Slice<u8>, level: i32) -> Result<Vector<u8>, ZlibError> {
+        let size = checkedTruncate<CULong>(data.length) ?? { return Err(ZlibError.TooLarge); };
+        let bound = unsafe { compressBound(size) };
+        var out = Vector<u8>.create();
+        match (out.resize(bound as usize, 0)) {
+            Ok() => {}
+            Err(_) => { return Err(ZlibError.OutOfMemory); }
+        }
+        var length = bound;
+        let space = out.viewMut();
+        let status = unsafe { compress2(space.ptr, borrow mut length as *mut CULong, data.ptr, size, level) };
+        if (status != Z_OK) {
+            return Err(Zlib.errorOf(status));
+        }
+        out.truncate(length as usize);
+        return Ok(out);
+    }
+
+    /// `packed`, zlib's format, uncompressed into at most `size` bytes: the size it had, which the format does not
+    /// record (`uncompress`). More data than that is `BufferTooSmall`.
+    /// Safety: zlib reads `packed.length` bytes from `packed.ptr` and writes at most `length` bytes, the size of `out`,
+    /// which it is told; it sets `length` to what it wrote, which `truncate` keeps.
+    public fn uncompress(packed: Slice<u8>, size: usize) -> Result<Vector<u8>, ZlibError> {
+        let packedSize = checkedTruncate<CULong>(packed.length) ?? { return Err(ZlibError.TooLarge); };
+        var length = checkedTruncate<CULong>(size) ?? { return Err(ZlibError.TooLarge); };
+        var out = Vector<u8>.create();
+        match (out.resize(size, 0)) {
+            Ok() => {}
+            Err(_) => { return Err(ZlibError.OutOfMemory); }
+        }
+        let space = out.viewMut();
+        let status = unsafe { uncompress(space.ptr, borrow mut length as *mut CULong, packed.ptr, packedSize) };
+        if (status != Z_OK) {
+            return Err(Zlib.errorOf(status));
+        }
+        out.truncate(length as usize);
+        return Ok(out);
+    }
+
+    /// The CRC-32 of `data` (`crc32`), as gzip, PNG and zip use it.
+    public fn crc32(data: Slice<u8>) -> u32 => Zlib.crc32Update(0, data);
+
+    /// The CRC-32 of the data that gave `crc`, followed by `data`.
+    /// Safety: zlib reads `chunk.length` bytes from `chunk.ptr`, a live slice of at most 1 GiB.
+    public fn crc32Update(crc: u32, data: Slice<u8>) -> u32 {
+        var value = crc as CULong;
+        var rest = data;
+        while (rest.length > 0) {
+            let take = if (rest.length > 0x40000000) 0x40000000 else rest.length;
+            let chunk = rest[..take];
+            value = unsafe { crc32(value, chunk.ptr, truncate<u32>(chunk.length)) };
+            rest = rest[take..];
+        }
+        return truncate<u32>(value as u64);
+    }
+
+    /// The Adler-32 of `data` (`adler32`), as zlib's format uses it.
+    public fn adler32(data: Slice<u8>) -> u32 => Zlib.adler32Update(1, data);
+
+    /// The Adler-32 of the data that gave `adler`, followed by `data`.
+    /// Safety: zlib reads `chunk.length` bytes from `chunk.ptr`, a live slice of at most 1 GiB.
+    public fn adler32Update(adler: u32, data: Slice<u8>) -> u32 {
+        var value = adler as CULong;
+        var rest = data;
+        while (rest.length > 0) {
+            let take = if (rest.length > 0x40000000) 0x40000000 else rest.length;
+            let chunk = rest[..take];
+            value = unsafe { adler32(value, chunk.ptr, truncate<u32>(chunk.length)) };
+            rest = rest[take..];
+        }
+        return truncate<u32>(value as u64);
+    }
+
+    /// The error a zlib status means.
+    fn errorOf(status: i32) -> ZlibError => match (status) {
+        Z_MEM_ERROR => ZlibError.OutOfMemory,
+        Z_BUF_ERROR => ZlibError.BufferTooSmall,
+        Z_DATA_ERROR => ZlibError.CorruptData,
+        Z_STREAM_ERROR => ZlibError.InvalidLevel,
+        _ => ZlibError.Failed,
+    };
+}
